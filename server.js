@@ -1,12 +1,12 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { S3Client, ListObjectsV2Command } = require('@aws-sdk/client-s3');
+const { S3Client, ListObjectsV2Command, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 
 const app = express();
 app.use(cors());
+app.use(express.json()); // Allow JSON body in requests
 
-// 1. Cloudflare Connection
 const s3 = new S3Client({
   region: 'auto',
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -16,52 +16,98 @@ const s3 = new S3Client({
   },
 });
 
-// 2. Your Public R2 URL (The base link for your music)
-// I copied this from your previous screenshot
 const R2_PUBLIC_URL = "https://pub-71abb8b18eb748488766471d0f373860.r2.dev";
+const BUCKET_NAME = process.env.R2_BUCKET_NAME;
 
-// 3. The Route: Get Files Directly from Cloudflare
+// --- HELPER: Parse Song Data ---
+const parseSong = (file, index) => {
+  let cleanName = file.Key.replace(/\(SPOTISAVER\)/g, '').replace('.mp3', '').trim();
+  let artist = "Unknown Artist";
+  let title = cleanName;
+  if (cleanName.includes('-')) {
+    const parts = cleanName.split('-');
+    artist = parts[0].trim();
+    title = parts.slice(1).join('-').trim();
+  }
+  return {
+    _id: file.Key, // Use filename as ID
+    title,
+    artist,
+    songUrl: `${R2_PUBLIC_URL}/${encodeURIComponent(file.Key)}`
+  };
+};
+
+// 1. GET ALL SONGS
 app.get('/songs', async (req, res) => {
   try {
-    const command = new ListObjectsV2Command({
-      Bucket: process.env.R2_BUCKET_NAME,
-    });
-    
+    const command = new ListObjectsV2Command({ Bucket: BUCKET_NAME });
     const data = await s3.send(command);
-    
-    // If bucket is empty, return empty list
-    if (!data.Contents) {
-      return res.json([]);
-    }
+    if (!data.Contents) return res.json([]);
 
-    // Convert Cloudflare file list into our "Song" format
     const songs = data.Contents
-      .filter(file => file.Key.endsWith('.mp3')) // Only show MP3s
-      .map((file, index) => {
-        // Simple logic to guess Artist/Title from filename
-        // Assumes format: "Artist - Title.mp3" or just "Title.mp3"
-        let artist = "Unknown";
-        let title = file.Key.replace('.mp3', '');
-
-        if (file.Key.includes('-')) {
-          const parts = file.Key.split('-');
-          artist = parts[0].trim();
-          title = parts[1].replace('.mp3', '').trim();
-        }
-
-        return {
-          _id: index, // Temporary ID
-          title: title,
-          artist: artist,
-          // Create the playable link automatically
-          songUrl: `${R2_PUBLIC_URL}/${encodeURIComponent(file.Key)}`
-        };
-      });
-
+      .filter(file => file.Key.endsWith('.mp3'))
+      .map(parseSong);
     res.json(songs);
   } catch (error) {
-    console.error("Error fetching from R2:", error);
-    res.status(500).json({ error: 'Failed to fetch songs' });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 2. GET ALL PLAYLISTS
+app.get('/playlists', async (req, res) => {
+  try {
+    const command = new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: 'playlists/' });
+    const data = await s3.send(command);
+    
+    if (!data.Contents) return res.json([]);
+    
+    // Convert "playlists/MyJam.json" -> "MyJam"
+    const playlists = data.Contents
+      .filter(file => file.Key.endsWith('.json'))
+      .map(file => ({
+        name: file.Key.replace('playlists/', '').replace('.json', ''),
+        fileKey: file.Key
+      }));
+    res.json(playlists);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 3. CREATE / UPDATE PLAYLIST
+app.post('/playlists', async (req, res) => {
+  try {
+    const { name, songs } = req.body; // name: "Gym", songs: [songObject1, songObject2]
+    const fileName = `playlists/${name}.json`;
+    
+    const command = new PutObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: fileName,
+      Body: JSON.stringify(songs),
+      ContentType: 'application/json'
+    });
+    
+    await s3.send(command);
+    res.json({ success: true, message: `Playlist ${name} saved!` });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to save playlist" });
+  }
+});
+
+// 4. GET SPECIFIC PLAYLIST
+app.get('/playlists/:name', async (req, res) => {
+  try {
+    const fileName = `playlists/${req.params.name}.json`;
+    
+    // We need to stream the file content to a string
+    const command = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: fileName });
+    const response = await s3.send(command);
+    const str = await response.Body.transformToString();
+    
+    res.json(JSON.parse(str));
+  } catch (error) {
+    res.status(404).json({ error: "Playlist not found" });
   }
 });
 
