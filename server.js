@@ -1,16 +1,12 @@
 require('dotenv').config();
 const express = require('express');
-const mongoose = require('mongoose');
 const cors = require('cors');
-const multer = require('multer');
-const { S3Client } = require('@aws-sdk/client-s3');
-const multerS3 = require('multer-s3');
+const { S3Client, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 
 const app = express();
-app.use(express.json());
 app.use(cors());
 
-// 1. Cloudflare R2 Configuration
+// 1. Cloudflare Connection
 const s3 = new S3Client({
   region: 'auto',
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -20,62 +16,52 @@ const s3 = new S3Client({
   },
 });
 
-// 2. Upload Middleware (Multer + S3)
-const upload = multer({
-  storage: multerS3({
-    s3: s3,
-    bucket: process.env.R2_BUCKET_NAME,
-    acl: 'public-read', // Helps with access permissions
-    contentType: multerS3.AUTO_CONTENT_TYPE, // Automatically sets audio/mpeg
-    key: function (req, file, cb) {
-      // Use the original filename but add a timestamp to make it unique
-      cb(null, Date.now().toString() + '-' + file.originalname);
-    }
-  })
-});
+// 2. Your Public R2 URL (The base link for your music)
+// I copied this from your previous screenshot
+const R2_PUBLIC_URL = "https://pub-71abb8b18eb748488766471d0f373860.r2.dev";
 
-// 3. Database & Schema
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log("✅ MongoDB Connected"))
-  .catch(err => console.error("❌ DB Error:", err));
-
-const songSchema = new mongoose.Schema({
-  title: String,
-  artist: String,
-  songUrl: String,
-});
-const Song = mongoose.model('Song', songSchema);
-
-// 4. Routes
-
-// GET: List all songs
+// 3. The Route: Get Files Directly from Cloudflare
 app.get('/songs', async (req, res) => {
-  const songs = await Song.find();
-  res.json(songs);
-});
-
-// POST: Upload a Song
-// 'audioFile' must match the name in the frontend form
-app.post('/upload', upload.single('audioFile'), async (req, res) => {
   try {
-    const { title, artist } = req.body;
-    
-    // Construct the public URL manually
-    // CHANGE THIS URL to your actual public R2 domain from Phase 1
-    const publicDomain = "https://pub-71abb8b18eb748488766471d0f373860.r2.dev"; 
-    const fileUrl = `${publicDomain}/${req.file.key}`;
-
-    const newSong = new Song({
-      title,
-      artist,
-      songUrl: fileUrl
+    const command = new ListObjectsV2Command({
+      Bucket: process.env.R2_BUCKET_NAME,
     });
+    
+    const data = await s3.send(command);
+    
+    // If bucket is empty, return empty list
+    if (!data.Contents) {
+      return res.json([]);
+    }
 
-    await newSong.save();
-    res.status(201).json(newSong);
+    // Convert Cloudflare file list into our "Song" format
+    const songs = data.Contents
+      .filter(file => file.Key.endsWith('.mp3')) // Only show MP3s
+      .map((file, index) => {
+        // Simple logic to guess Artist/Title from filename
+        // Assumes format: "Artist - Title.mp3" or just "Title.mp3"
+        let artist = "Unknown";
+        let title = file.Key.replace('.mp3', '');
+
+        if (file.Key.includes('-')) {
+          const parts = file.Key.split('-');
+          artist = parts[0].trim();
+          title = parts[1].replace('.mp3', '').trim();
+        }
+
+        return {
+          _id: index, // Temporary ID
+          title: title,
+          artist: artist,
+          // Create the playable link automatically
+          songUrl: `${R2_PUBLIC_URL}/${encodeURIComponent(file.Key)}`
+        };
+      });
+
+    res.json(songs);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Upload failed' });
+    console.error("Error fetching from R2:", error);
+    res.status(500).json({ error: 'Failed to fetch songs' });
   }
 });
 
