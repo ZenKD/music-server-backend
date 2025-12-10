@@ -1,12 +1,35 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { S3Client, ListObjectsV2Command, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const mongoose = require('mongoose');
+const { S3Client, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 
 const app = express();
 app.use(cors());
-app.use(express.json()); // Allow JSON body in requests
+app.use(express.json());
 
+// 1. Connect to MongoDB
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log("✅ MongoDB Connected"))
+  .catch(err => console.error("❌ DB Error:", err));
+
+// 2. Define Schemas
+const SongSchema = new mongoose.Schema({
+  title: String,
+  artist: String,
+  songUrl: String,
+  r2Key: { type: String, unique: true } // Prevents duplicates
+});
+
+const PlaylistSchema = new mongoose.Schema({
+  name: String,
+  songs: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Song' }] // Links to actual Song IDs
+});
+
+const Song = mongoose.model('Song', SongSchema);
+const Playlist = mongoose.model('Playlist', PlaylistSchema);
+
+// 3. Cloudflare Config
 const s3 = new S3Client({
   region: 'auto',
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -15,100 +38,81 @@ const s3 = new S3Client({
     secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
   },
 });
+const R2_PUBLIC_URL = "https://pub-71abb8b18eb748488766471d0f373860.r2.dev"; // CHECK THIS!
 
-const R2_PUBLIC_URL = "https://pub-71abb8b18eb748488766471d0f373860.r2.dev";
-const BUCKET_NAME = process.env.R2_BUCKET_NAME;
+// --- ROUTES ---
 
-// --- HELPER: Parse Song Data ---
-const parseSong = (file, index) => {
-  let cleanName = file.Key.replace(/\(SPOTISAVER\)/g, '').replace('.mp3', '').trim();
-  let artist = "Unknown Artist";
-  let title = cleanName;
-  if (cleanName.includes('-')) {
-    const parts = cleanName.split('-');
-    artist = parts[0].trim();
-    title = parts.slice(1).join('-').trim();
-  }
-  return {
-    _id: file.Key, // Use filename as ID
-    title,
-    artist,
-    songUrl: `${R2_PUBLIC_URL}/${encodeURIComponent(file.Key)}`
-  };
-};
-
-// 1. GET ALL SONGS
-app.get('/songs', async (req, res) => {
+// 🔄 SYNC: The "Magic Button" Route
+// Scans R2 and updates MongoDB automatically
+app.post('/sync', async (req, res) => {
   try {
-    const command = new ListObjectsV2Command({ Bucket: BUCKET_NAME });
+    console.log("Starting Sync...");
+    const command = new ListObjectsV2Command({ Bucket: process.env.R2_BUCKET_NAME });
     const data = await s3.send(command);
-    if (!data.Contents) return res.json([]);
 
-    const songs = data.Contents
-      .filter(file => file.Key.endsWith('.mp3'))
-      .map(parseSong);
-    res.json(songs);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+    if (!data.Contents) return res.json({ message: "Bucket is empty" });
 
-// 2. GET ALL PLAYLISTS
-app.get('/playlists', async (req, res) => {
-  try {
-    const command = new ListObjectsV2Command({ Bucket: BUCKET_NAME, Prefix: 'playlists/' });
-    const data = await s3.send(command);
-    
-    if (!data.Contents) return res.json([]);
-    
-    // Convert "playlists/MyJam.json" -> "MyJam"
-    const playlists = data.Contents
-      .filter(file => file.Key.endsWith('.json'))
-      .map(file => ({
-        name: file.Key.replace('playlists/', '').replace('.json', ''),
-        fileKey: file.Key
-      }));
-    res.json(playlists);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+    const mp3Files = data.Contents.filter(f => f.Key.endsWith('.mp3'));
+    let addedCount = 0;
 
-// 3. CREATE / UPDATE PLAYLIST
-app.post('/playlists', async (req, res) => {
-  try {
-    const { name, songs } = req.body; // name: "Gym", songs: [songObject1, songObject2]
-    const fileName = `playlists/${name}.json`;
-    
-    const command = new PutObjectCommand({
-      Bucket: BUCKET_NAME,
-      Key: fileName,
-      Body: JSON.stringify(songs),
-      ContentType: 'application/json'
-    });
-    
-    await s3.send(command);
-    res.json({ success: true, message: `Playlist ${name} saved!` });
+    for (const file of mp3Files) {
+      // Check if song already exists in DB
+      const exists = await Song.findOne({ r2Key: file.Key });
+      if (!exists) {
+        // Auto-Generate Title/Artist
+        let cleanName = file.Key.replace(/\(SPOTISAVER\)/g, '').replace('.mp3', '').trim();
+        let artist = "Unknown Artist";
+        let title = cleanName;
+        if (cleanName.includes('-')) {
+          const parts = cleanName.split('-');
+          artist = parts[0].trim();
+          title = parts.slice(1).join('-').trim();
+        }
+
+        await Song.create({
+          title,
+          artist,
+          r2Key: file.Key,
+          songUrl: `${R2_PUBLIC_URL}/${encodeURIComponent(file.Key)}`
+        });
+        addedCount++;
+      }
+    }
+    res.json({ success: true, message: `Sync complete! Added ${addedCount} new songs.` });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Failed to save playlist" });
+    res.status(500).json({ error: "Sync failed" });
   }
 });
 
-// 4. GET SPECIFIC PLAYLIST
-app.get('/playlists/:name', async (req, res) => {
-  try {
-    const fileName = `playlists/${req.params.name}.json`;
-    
-    // We need to stream the file content to a string
-    const command = new GetObjectCommand({ Bucket: BUCKET_NAME, Key: fileName });
-    const response = await s3.send(command);
-    const str = await response.Body.transformToString();
-    
-    res.json(JSON.parse(str));
-  } catch (error) {
-    res.status(404).json({ error: "Playlist not found" });
+// GET Songs
+app.get('/songs', async (req, res) => {
+  const songs = await Song.find().sort({ title: 1 }); // Alphabetical order
+  res.json(songs);
+});
+
+// GET Playlists
+app.get('/playlists', async (req, res) => {
+  const playlists = await Playlist.find().populate('songs');
+  res.json(playlists);
+});
+
+// POST Create Playlist
+app.post('/playlists', async (req, res) => {
+  const { name } = req.body;
+  const newPlaylist = await Playlist.create({ name, songs: [] });
+  res.json(newPlaylist);
+});
+
+// POST Add Song to Playlist
+app.post('/playlists/:id/add', async (req, res) => {
+  const { songId } = req.body;
+  const playlist = await Playlist.findById(req.params.id);
+  if (!playlist.songs.includes(songId)) {
+    playlist.songs.push(songId);
+    await playlist.save();
   }
+  res.json(playlist);
 });
 
 const PORT = process.env.PORT || 5000;
